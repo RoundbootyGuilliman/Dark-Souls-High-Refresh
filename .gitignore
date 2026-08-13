@@ -1,0 +1,11 @@
+.idea/
+.vs/
+bin/
+obj/
+dist/
+*.log
+*.user
+*.suo
+*.pdb
+*.lib
+*.exp
