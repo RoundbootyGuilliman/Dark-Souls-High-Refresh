@@ -8,23 +8,60 @@
 // DirectInput8Create, so the game loads this proxy normally; the export below
 // forwards that call to the real system DLL while DSHR runs in-process.
 
-// Dark Souls Remastered 1.03 (SHA-1 F0ECFBE20D780751248DFB2A9759D6215E246676)
-// imports QueryPerformanceCounter through this IAT slot. Only the two reads in
-// its render-frame busy wait receive a scaled clock; all simulation and system
-// timing reads remain untouched.
-#define QPC_IAT_RVA 0x20B5120
-#define PACER_FIRST_CHECK_RETURN_RVA 0xCDF898
-#define PACER_LOOP_CHECK_RETURN_RVA  0xCDF8CE
-#define SIMULATION_STEP_VTABLE_ENTRY_RVA 0x1AC54A8
-#define SIMULATION_STEP_RVA 0x24DDD0
-#define FRPG_FX_UPDATE_VTABLE_ENTRY_RVA 0x13678F8
-#define FRPG_FX_UPDATE_RVA 0x4F6380
-#define REMO_ACTIVE_STATE_ENTRY_RVA 0x1D0DB08
-#define REMO_ACTIVE_STATE_RVA 0x28EAE0
-#define HAVOK_STEP_CALL_RVA 0x15BD5E
-#define HAVOK_STEP_RVA 0x2A18B0
-#define FLIPPER_60_VTABLE_RVA 0x12A7248
-#define FLIPPER_140_VTABLE_RVA 0x12A72A0
+#define DSHR_VERSION "1.3"
+
+// Both supported executables report game patch 1.03, but the November 2022
+// Steam security update was separately linked and moved internal functions,
+// callback tables, imports and scheduler vtables. Keep a complete address set
+// for each build and select it from immutable PE metadata before touching any
+// process memory.
+typedef struct BuildProfile
+{
+    const char *name;
+    DWORD timestamp;
+    DWORD image_size;
+    DWORD checksum;
+    uintptr_t qpc_iat_rva;
+    uintptr_t pacer_first_check_return_rva;
+    uintptr_t pacer_loop_check_return_rva;
+    uintptr_t simulation_step_vtable_entry_rva;
+    uintptr_t simulation_step_rva;
+    uintptr_t frpg_fx_update_vtable_entry_rva;
+    uintptr_t frpg_fx_update_rva;
+    uintptr_t remo_active_state_entry_rva;
+    uintptr_t remo_active_state_rva;
+    uintptr_t havok_step_call_rva;
+    uintptr_t havok_step_rva;
+    uintptr_t flipper_60_vtable_rva;
+    uintptr_t flipper_60_destructor_rva;
+    uintptr_t flipper_140_vtable_rva;
+    uintptr_t flipper_140_destructor_rva;
+} BuildProfile;
+
+static const BuildProfile g_build_profiles[] = {
+    {
+        "2018 1.03 (F0ECFBE20D780751248DFB2A9759D6215E246676)",
+        0x5B3E2C36, 0x03817800, 0x00000000,
+        0x20B5120, 0xCDF898, 0xCDF8CE,
+        0x1AC54A8, 0x24DDD0,
+        0x13678F8, 0x4F6380,
+        0x1D0DB08, 0x28EAE0,
+        0x15BD5E, 0x2A18B0,
+        0x12A7248, 0x0BB8A0,
+        0x12A72A0, 0x0BB9E0,
+    },
+    {
+        "2022 Steam 1.03 (9150CC63C617332ED3C2C66E7566ED67E3292DA0)",
+        0x6344CA56, 0x0319B000, 0x02FF5493,
+        0x2017344, 0xCE3478, 0xCE34AE,
+        0x1A294B8, 0x24F6B0,
+        0x136B618, 0x4F7450,
+        0x1C71AF8, 0x290400,
+        0x15D58E, 0x2A31D0,
+        0x12AB268, 0x0BB480,
+        0x12AB2C0, 0x0BB5C0,
+    },
+};
 
 
 typedef BOOL (WINAPI *QueryPerformanceCounterFn)(LARGE_INTEGER *);
@@ -37,6 +74,7 @@ typedef HRESULT (WINAPI *DirectInput8CreateFn)(HINSTANCE instance, DWORD version
 
 static HMODULE g_module;
 static BYTE *g_image_base;
+static const BuildProfile *g_build_profile;
 static QueryPerformanceCounterFn g_query_performance_counter;
 static SimulationStepFn g_simulation_step;
 static FrpgFxUpdateFn g_frpg_fx_update;
@@ -82,7 +120,7 @@ static BOOL IsDarkSoulsRemasteredProcess(void)
     return nt_headers->Signature == IMAGE_NT_SIGNATURE &&
            nt_headers->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64 &&
            nt_headers->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
-           nt_headers->OptionalHeader.SizeOfImage > QPC_IAT_RVA + sizeof(void *);
+           nt_headers->OptionalHeader.SizeOfImage >= 0x01000000;
 }
 
 static void BuildSiblingPath(char *output, const char *name)
@@ -112,6 +150,162 @@ static void LogLine(const char *format, ...)
         WriteFile(file, text, (DWORD)lstrlenA(text), &written, NULL);
         CloseHandle(file);
     }
+}
+
+static IMAGE_NT_HEADERS64 *GetImageHeaders(void)
+{
+    if (!g_image_base)
+        return NULL;
+    IMAGE_DOS_HEADER *dos_header = (IMAGE_DOS_HEADER *)g_image_base;
+    if (dos_header->e_magic != IMAGE_DOS_SIGNATURE ||
+        dos_header->e_lfanew <= 0 || dos_header->e_lfanew >= 0x100000)
+        return NULL;
+    IMAGE_NT_HEADERS64 *nt_headers =
+        (IMAGE_NT_HEADERS64 *)(g_image_base + dos_header->e_lfanew);
+    if (nt_headers->Signature != IMAGE_NT_SIGNATURE ||
+        nt_headers->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+        nt_headers->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        return NULL;
+    return nt_headers;
+}
+
+static const BuildProfile *SelectBuildProfile(IMAGE_NT_HEADERS64 *nt_headers)
+{
+    for (size_t index = 0; index < sizeof(g_build_profiles) / sizeof(g_build_profiles[0]);
+         ++index)
+    {
+        const BuildProfile *profile = &g_build_profiles[index];
+        if (nt_headers->FileHeader.TimeDateStamp == profile->timestamp &&
+            nt_headers->OptionalHeader.SizeOfImage == profile->image_size &&
+            nt_headers->OptionalHeader.CheckSum == profile->checksum)
+            return profile;
+    }
+    return NULL;
+}
+
+static BOOL IsProfileRvaValid(uintptr_t rva, size_t size)
+{
+    return g_build_profile && rva <= g_build_profile->image_size &&
+           size <= g_build_profile->image_size - rva;
+}
+
+static BOOL IsExecutableAddress(const void *address)
+{
+    MEMORY_BASIC_INFORMATION information;
+    if (!VirtualQuery(address, &information, sizeof(information)) ||
+        information.State != MEM_COMMIT || (information.Protect & PAGE_GUARD) != 0)
+        return FALSE;
+    DWORD protection = information.Protect & 0xFF;
+    return protection == PAGE_EXECUTE || protection == PAGE_EXECUTE_READ ||
+           protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
+}
+
+static BOOL ValidatePacerCall(uintptr_t return_rva, void **qpc_iat)
+{
+    BYTE *return_address = g_image_base + return_rva;
+    BYTE *call = return_address - 6;
+    if (call[0] != 0xFF || call[1] != 0x15)
+    {
+        LogLine("ERROR: frame-pacer call before RVA %p has unexpected bytes %02X %02X",
+                (void *)return_rva, call[0], call[1]);
+        return FALSE;
+    }
+
+    LONG displacement;
+    CopyMemory(&displacement, call + 2, sizeof(displacement));
+    void **actual_iat = (void **)(return_address + displacement);
+    if (actual_iat != qpc_iat)
+    {
+        LogLine("ERROR: frame-pacer call before RVA %p uses IAT %p (expected %p)",
+                (void *)return_rva, actual_iat, qpc_iat);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL ValidateBuildAddresses(void)
+{
+    const BuildProfile *profile = g_build_profile;
+    const uintptr_t rvas[] = {
+        profile->qpc_iat_rva,
+        profile->pacer_first_check_return_rva,
+        profile->pacer_loop_check_return_rva,
+        profile->simulation_step_vtable_entry_rva,
+        profile->simulation_step_rva,
+        profile->frpg_fx_update_vtable_entry_rva,
+        profile->frpg_fx_update_rva,
+        profile->remo_active_state_entry_rva,
+        profile->remo_active_state_rva,
+        profile->havok_step_call_rva,
+        profile->havok_step_rva,
+        profile->flipper_60_vtable_rva,
+        profile->flipper_60_destructor_rva,
+        profile->flipper_140_vtable_rva,
+        profile->flipper_140_destructor_rva,
+    };
+    for (size_t index = 0; index < sizeof(rvas) / sizeof(rvas[0]); ++index)
+    {
+        if (!IsProfileRvaValid(rvas[index], sizeof(void *)))
+        {
+            LogLine("ERROR: build profile contains out-of-range RVA %p", (void *)rvas[index]);
+            return FALSE;
+        }
+    }
+
+    void **qpc_iat = (void **)(g_image_base + profile->qpc_iat_rva);
+    if (!*qpc_iat || !IsExecutableAddress(*qpc_iat) ||
+        !ValidatePacerCall(profile->pacer_first_check_return_rva, qpc_iat) ||
+        !ValidatePacerCall(profile->pacer_loop_check_return_rva, qpc_iat))
+    {
+        LogLine("ERROR: frame-pacer import validation failed");
+        return FALSE;
+    }
+
+    void *simulation_step = *(void **)(g_image_base +
+                                        profile->simulation_step_vtable_entry_rva);
+    if (simulation_step != g_image_base + profile->simulation_step_rva)
+    {
+        LogLine("ERROR: simulation vtable entry has unexpected value %p (expected %p)",
+                simulation_step, g_image_base + profile->simulation_step_rva);
+        return FALSE;
+    }
+
+    void *fx_update = *(void **)(g_image_base + profile->frpg_fx_update_vtable_entry_rva);
+    if (fx_update != g_image_base + profile->frpg_fx_update_rva)
+    {
+        LogLine("ERROR: FX update vtable entry has unexpected value %p (expected %p)",
+                fx_update, g_image_base + profile->frpg_fx_update_rva);
+        return FALSE;
+    }
+
+    void *flipper_60_destructor = *(void **)(g_image_base + profile->flipper_60_vtable_rva);
+    void *flipper_140_destructor = *(void **)(g_image_base + profile->flipper_140_vtable_rva);
+    if (flipper_60_destructor != g_image_base + profile->flipper_60_destructor_rva ||
+        flipper_140_destructor != g_image_base + profile->flipper_140_destructor_rva)
+    {
+        LogLine("ERROR: scheduler vtable validation failed: 60=%p (expected %p), 140=%p (expected %p)",
+                flipper_60_destructor,
+                g_image_base + profile->flipper_60_destructor_rva,
+                flipper_140_destructor,
+                g_image_base + profile->flipper_140_destructor_rva);
+        return FALSE;
+    }
+
+    BYTE *havok_call = g_image_base + profile->havok_step_call_rva;
+    if (havok_call[0] != 0xE8)
+    {
+        LogLine("ERROR: Havok call site has unexpected opcode %02X", havok_call[0]);
+        return FALSE;
+    }
+    LONG havok_displacement;
+    CopyMemory(&havok_displacement, havok_call + 1, sizeof(havok_displacement));
+    if (havok_call + 5 + havok_displacement != g_image_base + profile->havok_step_rva)
+    {
+        LogLine("ERROR: Havok call target validation failed");
+        return FALSE;
+    }
+
+    return TRUE;
 }
 
 static BOOL PatchPointer(void **address, void *replacement)
@@ -255,8 +449,8 @@ static BOOL WINAPI HookQueryPerformanceCounter(LARGE_INTEGER *counter)
     void *caller = __builtin_return_address(0);
     if (!result || g_target_fps <= 60 ||
         InterlockedCompareExchange(&g_scheduler_active, 0, 0) == 0 ||
-        (caller != g_image_base + PACER_FIRST_CHECK_RETURN_RVA &&
-         caller != g_image_base + PACER_LOOP_CHECK_RETURN_RVA))
+        (caller != g_image_base + g_build_profile->pacer_first_check_return_rva &&
+         caller != g_image_base + g_build_profile->pacer_loop_check_return_rva))
         return result;
 
     LONG64 real_counter = counter->QuadPart;
@@ -297,9 +491,10 @@ static void HookSimulationStep(void *step, float frame_time)
     if (GetTickCount64() - g_install_time_ms >= 5000 &&
         InterlockedCompareExchange(&g_havok_patch_state, 1, 0) == 0)
     {
-        BOOL installed = PatchHavokTimestepCall(g_image_base + HAVOK_STEP_CALL_RVA,
-                                                g_image_base + HAVOK_STEP_RVA,
-                                                60.0f / (float)g_target_fps);
+        BOOL installed = PatchHavokTimestepCall(
+            g_image_base + g_build_profile->havok_step_call_rva,
+            g_image_base + g_build_profile->havok_step_rva,
+            60.0f / (float)g_target_fps);
         InterlockedExchange(&g_havok_patch_state, installed ? 2 : -1);
     }
     g_simulation_step(step, corrected_frame_time);
@@ -483,8 +678,10 @@ static BOOL HasVisibleProcessWindow(void)
 static BOOL ActivateHighRefreshScheduler(void)
 {
     BOOL window_seen = FALSE;
-    uintptr_t flipper_60_vtable = (uintptr_t)(g_image_base + FLIPPER_60_VTABLE_RVA);
-    void *flipper_140_vtable = g_image_base + FLIPPER_140_VTABLE_RVA;
+    uintptr_t flipper_60_vtable =
+        (uintptr_t)(g_image_base + g_build_profile->flipper_60_vtable_rva);
+    void *flipper_140_vtable =
+        g_image_base + g_build_profile->flipper_140_vtable_rva;
 
     for (DWORD waited_ms = 0; waited_ms < 45000; waited_ms += 250)
     {
@@ -572,51 +769,39 @@ static DWORD WINAPI InstallHook(void *unused)
     }
 
     g_image_base = (BYTE *)GetModuleHandleA(NULL);
-    g_install_time_ms = GetTickCount64();
-    void **qpc_iat = (void **)(g_image_base + QPC_IAT_RVA);
-    g_query_performance_counter = (QueryPerformanceCounterFn)*qpc_iat;
-    if (!g_query_performance_counter || !PatchPointer(qpc_iat, HookQueryPerformanceCounter))
+    IMAGE_NT_HEADERS64 *nt_headers = GetImageHeaders();
+    if (!nt_headers)
     {
-        LogLine("ERROR: could not install the frame-pacer clock hook (Win32=%lu)", GetLastError());
+        LogLine("ERROR: could not read the DarkSoulsRemastered.exe PE headers");
         return 2;
     }
 
-    void **simulation_vtable_entry = (void **)(g_image_base + SIMULATION_STEP_VTABLE_ENTRY_RVA);
-    g_simulation_step = (SimulationStepFn)*simulation_vtable_entry;
-    if (g_simulation_step != (SimulationStepFn)(g_image_base + SIMULATION_STEP_RVA))
+    g_build_profile = SelectBuildProfile(nt_headers);
+    if (!g_build_profile)
     {
-        LogLine("ERROR: simulation vtable entry has unexpected value %p (expected %p)",
-                g_simulation_step, g_image_base + SIMULATION_STEP_RVA);
-        PatchPointer(qpc_iat, g_query_performance_counter);
+        LogLine("ERROR: unsupported DarkSoulsRemastered.exe build: timestamp=%08lX imageSize=%08lX checksum=%08lX",
+                nt_headers->FileHeader.TimeDateStamp,
+                nt_headers->OptionalHeader.SizeOfImage,
+                nt_headers->OptionalHeader.CheckSum);
         return 3;
     }
-    if (!PatchPointer(simulation_vtable_entry, HookSimulationStep))
-    {
-        LogLine("ERROR: could not install the simulation timestep hook (Win32=%lu)", GetLastError());
-        PatchPointer(qpc_iat, g_query_performance_counter);
+    LogLine("DSHR v%s recognized %s", DSHR_VERSION, g_build_profile->name);
+
+    if (!ValidateBuildAddresses())
         return 4;
-    }
 
+    void **qpc_iat = (void **)(g_image_base + g_build_profile->qpc_iat_rva);
+    void **simulation_vtable_entry =
+        (void **)(g_image_base + g_build_profile->simulation_step_vtable_entry_rva);
     void **frpg_fx_update_vtable_entry =
-        (void **)(g_image_base + FRPG_FX_UPDATE_VTABLE_ENTRY_RVA);
-    g_frpg_fx_update = (FrpgFxUpdateFn)*frpg_fx_update_vtable_entry;
-    if (g_frpg_fx_update != (FrpgFxUpdateFn)(g_image_base + FRPG_FX_UPDATE_RVA))
-    {
-        LogLine("ERROR: FX update vtable entry has unexpected value %p (expected %p)",
-                g_frpg_fx_update, g_image_base + FRPG_FX_UPDATE_RVA);
-        PatchPointer(simulation_vtable_entry, g_simulation_step);
-        PatchPointer(qpc_iat, g_query_performance_counter);
-        return 5;
-    }
-    if (!PatchPointer(frpg_fx_update_vtable_entry, HookFrpgFxUpdate))
-    {
-        LogLine("ERROR: could not install the FX timestep hook (Win32=%lu)", GetLastError());
-        PatchPointer(simulation_vtable_entry, g_simulation_step);
-        PatchPointer(qpc_iat, g_query_performance_counter);
-        return 6;
-    }
+        (void **)(g_image_base + g_build_profile->frpg_fx_update_vtable_entry_rva);
+    void **remo_active_state_entry =
+        (void **)(g_image_base + g_build_profile->remo_active_state_entry_rva);
 
-    void **remo_active_state_entry = (void **)(g_image_base + REMO_ACTIVE_STATE_ENTRY_RVA);
+    g_query_performance_counter = (QueryPerformanceCounterFn)*qpc_iat;
+    g_simulation_step = (SimulationStepFn)*simulation_vtable_entry;
+    g_frpg_fx_update = (FrpgFxUpdateFn)*frpg_fx_update_vtable_entry;
+
     // This callback table is populated by a game-side static initializer after
     // our proxy is loaded. Wait on the hook worker thread until that initializer
     // publishes the supported function instead of racing it or treating its
@@ -628,14 +813,35 @@ static DWORD WINAPI InstallHook(void *unused)
             break;
         Sleep(10);
     }
-    if (g_remo_active_state != (RemoActiveStateFn)(g_image_base + REMO_ACTIVE_STATE_RVA))
+    if (g_remo_active_state !=
+        (RemoActiveStateFn)(g_image_base + g_build_profile->remo_active_state_rva))
     {
         LogLine("ERROR: Remo active-state entry has unexpected value %p (expected %p)",
-                g_remo_active_state, g_image_base + REMO_ACTIVE_STATE_RVA);
-        PatchPointer(frpg_fx_update_vtable_entry, g_frpg_fx_update);
-        PatchPointer(simulation_vtable_entry, g_simulation_step);
+                g_remo_active_state,
+                g_image_base + g_build_profile->remo_active_state_rva);
+        return 5;
+    }
+
+    g_install_time_ms = GetTickCount64();
+    if (!PatchPointer(qpc_iat, HookQueryPerformanceCounter))
+    {
+        LogLine("ERROR: could not install the frame-pacer clock hook (Win32=%lu)",
+                GetLastError());
+        return 6;
+    }
+    if (!PatchPointer(simulation_vtable_entry, HookSimulationStep))
+    {
+        LogLine("ERROR: could not install the simulation timestep hook (Win32=%lu)",
+                GetLastError());
         PatchPointer(qpc_iat, g_query_performance_counter);
         return 7;
+    }
+    if (!PatchPointer(frpg_fx_update_vtable_entry, HookFrpgFxUpdate))
+    {
+        LogLine("ERROR: could not install the FX timestep hook (Win32=%lu)", GetLastError());
+        PatchPointer(simulation_vtable_entry, g_simulation_step);
+        PatchPointer(qpc_iat, g_query_performance_counter);
+        return 8;
     }
     if (!PatchPointer(remo_active_state_entry, HookRemoActiveState))
     {
@@ -643,14 +849,20 @@ static DWORD WINAPI InstallHook(void *unused)
         PatchPointer(frpg_fx_update_vtable_entry, g_frpg_fx_update);
         PatchPointer(simulation_vtable_entry, g_simulation_step);
         PatchPointer(qpc_iat, g_query_performance_counter);
-        return 8;
+        return 9;
     }
 
     if (!ActivateHighRefreshScheduler())
-        return 9;
+    {
+        PatchPointer(remo_active_state_entry, g_remo_active_state);
+        PatchPointer(frpg_fx_update_vtable_entry, g_frpg_fx_update);
+        PatchPointer(simulation_vtable_entry, g_simulation_step);
+        PatchPointer(qpc_iat, g_query_performance_counter);
+        return 10;
+    }
 
-    LogLine("DSHR proxy hooks and high-refresh scheduler active; Havok timing correction armed: targetFPS=%u timestepScale=%.9f",
-            g_target_fps, 60.0f / (float)g_target_fps);
+    LogLine("DSHR v%s proxy hooks and high-refresh scheduler active; Havok timing correction armed: targetFPS=%u timestepScale=%.9f",
+            DSHR_VERSION, g_target_fps, 60.0f / (float)g_target_fps);
     return 0;
 }
 

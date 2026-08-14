@@ -6,7 +6,7 @@ It uses the dormant `FrpgFlipper_140FPS` scheduler included in the game and corr
 
 ## Installation
 
-1. Download `Dark-Souls-High-Refresh-v1.2.zip` from the [releases](https://github.com/RoundbootyGuilliman/Dark-Souls-High-Refresh/releases) section.
+1. Download `Dark-Souls-High-Refresh-v1.3.zip` from the [releases](https://github.com/RoundbootyGuilliman/Dark-Souls-High-Refresh/releases) section.
 2. Extract its contents into the Dark Souls Remastered directory beside `DarkSoulsRemastered.exe`.
 3. Open `DSHRHook.ini` and set `TargetFPS` to the desired frame rate. For the smoothest VRR experience it is recommended to keep this a few frames below your screen refresh rate (e.g. 162 for a 165hz screen).
 4. Start the game normally.
@@ -33,22 +33,24 @@ Driver-level frame caps, V-sync, display refresh, or insufficient performance ca
 - FromSoftware's Remo in-engine cinematics.
 - (v1.1) Havok cloth and rigid-body physics timing.
 - (v1.2) Launcher-free proxy loading with no cross-process injection.
+- (v1.3) Support for the current November 2022 Steam executable.
 
 ## Uninstallation
 
 Close the game before uninstalling.
 
-- v1.2: Remove `dinput8.dll`, `DSHRHook.ini`, and `DSHRHook.log` from the game directory.
-- v1.0 and v1.1: Remove `DSHRLauncher.exe`, `DSHRHook.dll`, `DSHRHook.ini`, `DSHRHook.log`, and `DSHR.log` from the game directory.
+- v1.2 and later: Remove `dinput8.dll`, `DSHRHook.ini`, and `DSHRHook.log` from the game directory.
+- v1.0 / v1.1: Remove `DSHRLauncher.exe`, `DSHRHook.dll`, `DSHRHook.ini`, `DSHRHook.log`, and `DSHR.log` from the game directory.
 
 ## Tested with
 
-- Dark Souls Remastered PC patch `1.03`.
-- `DarkSoulsRemastered.exe` SHA-1 `F0ECFBE20D780751248DFB2A9759D6215E246676`.
+- Dark Souls Remastered PC patch `1.03` and `1.03.1` with either supported executable:
+  - 2018 build SHA-1 `F0ECFBE20D780751248DFB2A9759D6215E246676`.
+  - November 2022 Steam build SHA-1 `9150CC63C617332ED3C2C66E7566ED67E3292DA0`.
 - Sustained gameplay and visual effects at 117 FPS / 120hz, and 162 FPS / 165hz.
 
-Only the exact executable build identified above is supported.
-Multiplayer compatibility has not been validated; it is recommended to keep the game offline while testing. Back up irreplaceable saves.
+Only the exact executable builds identified above are supported.
+Multiplayer compatibility has not been validated; keep the game offline while using the mod. Back up irreplaceable saves.
 
 ## Bug reporting
 
