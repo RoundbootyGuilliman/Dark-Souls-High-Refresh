@@ -36,7 +36,10 @@ Driver-level frame caps, V-sync, display refresh, or insufficient performance ca
 
 ## Uninstallation
 
-Close the game and remove `dinput8.dll`, `DSHRHook.ini`, and `DSHRHook.log` from the game directory.
+Close the game before uninstalling.
+
+- v1.2: Remove `dinput8.dll`, `DSHRHook.ini`, and `DSHRHook.log` from the game directory.
+- v1.0 and v1.1: Remove `DSHRLauncher.exe`, `DSHRHook.dll`, `DSHRHook.ini`, `DSHRHook.log`, and `DSHR.log` from the game directory.
 
 ## Tested with
 
