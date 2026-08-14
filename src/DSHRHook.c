@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdint.h>
 
 // Dark Souls Remastered 1.03 (SHA-1 F0ECFBE20D780751248DFB2A9759D6215E246676)
 // imports QueryPerformanceCounter through this IAT slot. Only the two reads in
@@ -16,6 +17,8 @@
 #define FRPG_FX_UPDATE_RVA 0x4F6380
 #define REMO_ACTIVE_STATE_ENTRY_RVA 0x1D0DB08
 #define REMO_ACTIVE_STATE_RVA 0x28EAE0
+#define HAVOK_STEP_CALL_RVA 0x15BD5E
+#define HAVOK_STEP_RVA 0x2A18B0
 
 
 typedef BOOL (WINAPI *QueryPerformanceCounterFn)(LARGE_INTEGER *);
@@ -29,14 +32,17 @@ static QueryPerformanceCounterFn g_query_performance_counter;
 static SimulationStepFn g_simulation_step;
 static FrpgFxUpdateFn g_frpg_fx_update;
 static RemoActiveStateFn g_remo_active_state;
+static void *g_havok_call_relay;
 static UINT g_target_fps = 140;
 static volatile LONG64 g_pacer_anchor;
 static volatile LONG g_activation_logged;
 static volatile LONG g_simulation_logged;
 static volatile LONG g_frpg_fx_logged;
 static volatile LONG g_remo_logged;
+static volatile LONG g_havok_patch_state;
 static volatile LONG g_remo_tick_phase;
 static ULONGLONG g_remo_last_input_ms;
+static ULONGLONG g_install_time_ms;
 static char g_log_path[MAX_PATH];
 
 
@@ -81,6 +87,121 @@ static BOOL PatchPointer(void **address, void *replacement)
     return TRUE;
 }
 
+static void *AllocateRelayNear(BYTE *call_site)
+{
+    SYSTEM_INFO system_info;
+    GetSystemInfo(&system_info);
+    uintptr_t granularity = (uintptr_t)system_info.dwAllocationGranularity;
+
+    // Start after the mapped executable image so allocation cannot collide
+    // with any of the game's sections. Fall back to a conservative image size
+    // if the in-memory PE headers are unexpectedly unavailable.
+    uintptr_t image_size = 0x04000000u;
+    IMAGE_DOS_HEADER *dos_header = (IMAGE_DOS_HEADER *)g_image_base;
+    if (dos_header->e_magic == IMAGE_DOS_SIGNATURE &&
+        dos_header->e_lfanew > 0 && dos_header->e_lfanew < 0x100000)
+    {
+        IMAGE_NT_HEADERS64 *nt_headers =
+            (IMAGE_NT_HEADERS64 *)(g_image_base + dos_header->e_lfanew);
+        if (nt_headers->Signature == IMAGE_NT_SIGNATURE &&
+            nt_headers->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
+            nt_headers->OptionalHeader.SizeOfImage)
+            image_size = nt_headers->OptionalHeader.SizeOfImage;
+    }
+
+    uintptr_t start = ((uintptr_t)g_image_base + image_size + granularity - 1) &
+                      ~(granularity - 1);
+    uintptr_t limit = (uintptr_t)call_site + 0x70000000u;
+    for (uintptr_t candidate = start; candidate < limit; candidate += granularity)
+    {
+        void *relay = VirtualAlloc((void *)candidate, 0x1000,
+                                   MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (relay)
+            return relay;
+    }
+    return NULL;
+}
+
+static BOOL PatchHavokTimestepCall(BYTE *call_site, void *expected_target,
+                                   float timestep_scale)
+{
+    if (call_site[0] != 0xE8)
+    {
+        LogLine("ERROR: Havok call site has unexpected opcode %02X", call_site[0]);
+        return FALSE;
+    }
+
+    LONG original_displacement;
+    CopyMemory(&original_displacement, call_site + 1, sizeof(original_displacement));
+    BYTE *actual_target = call_site + 5 + original_displacement;
+    if (actual_target != (BYTE *)expected_target)
+    {
+        LogLine("ERROR: Havok call site targets %p (expected %p)",
+                actual_target, expected_target);
+        return FALSE;
+    }
+
+    g_havok_call_relay = AllocateRelayNear(call_site);
+    if (!g_havok_call_relay)
+    {
+        LogLine("ERROR: could not allocate a nearby Havok timestep relay (Win32=%lu)",
+                GetLastError());
+        return FALSE;
+    }
+
+    // The high-refresh scheduler also advances this separate Havok path once
+    // per displayed frame with a fixed 1/60-second value. Scale XMM1 before
+    // forwarding to the original function so cloth and rigid bodies retain
+    // their native timing while preserving any existing timestep multiplier.
+    BYTE relay_code[17] = {
+        0xF3, 0x0F, 0x59, 0x0D, 0x05, 0x00, 0x00, 0x00, // mulss xmm1,[rip+5]
+        0xE9, 0x00, 0x00, 0x00, 0x00                    // jmp original target
+    };
+    intptr_t original_jump = (BYTE *)expected_target -
+                             ((BYTE *)g_havok_call_relay + 13);
+    if (original_jump < INT32_MIN || original_jump > INT32_MAX)
+    {
+        LogLine("ERROR: original Havok step at %p is out of range from relay %p",
+                expected_target, g_havok_call_relay);
+        goto release_relay;
+    }
+
+    LONG original_relative_jump = (LONG)original_jump;
+    CopyMemory(relay_code + 9, &original_relative_jump, sizeof(original_relative_jump));
+    CopyMemory(relay_code + 13, &timestep_scale, sizeof(timestep_scale));
+    CopyMemory(g_havok_call_relay, relay_code, sizeof(relay_code));
+    FlushInstructionCache(GetCurrentProcess(), g_havok_call_relay, sizeof(relay_code));
+
+    intptr_t displacement = (BYTE *)g_havok_call_relay - (call_site + 5);
+    if (displacement < INT32_MIN || displacement > INT32_MAX)
+    {
+        LogLine("ERROR: Havok timestep relay at %p is out of range from %p",
+                g_havok_call_relay, call_site);
+        goto release_relay;
+    }
+
+    LONG relative_displacement = (LONG)displacement;
+    DWORD old_protection;
+    if (!VirtualProtect(call_site, 5, PAGE_EXECUTE_READWRITE, &old_protection))
+    {
+        LogLine("ERROR: could not make the Havok call site writable (Win32=%lu)",
+                GetLastError());
+        goto release_relay;
+    }
+    CopyMemory(call_site + 1, &relative_displacement, sizeof(relative_displacement));
+    FlushInstructionCache(GetCurrentProcess(), call_site, 5);
+    DWORD ignored;
+    VirtualProtect(call_site, 5, old_protection, &ignored);
+    LogLine("DSHR Havok timestep correction active: call=%p relay=%p original=%p scale=%.9f",
+            call_site, g_havok_call_relay, expected_target, timestep_scale);
+    return TRUE;
+
+release_relay:
+    VirtualFree(g_havok_call_relay, 0, MEM_RELEASE);
+    g_havok_call_relay = NULL;
+    return FALSE;
+}
+
 
 static BOOL WINAPI HookQueryPerformanceCounter(LARGE_INTEGER *counter)
 {
@@ -116,6 +237,18 @@ static void HookSimulationStep(void *step, float frame_time)
     if (InterlockedCompareExchange(&g_simulation_logged, 1, 0) == 0)
         LogLine("DSHR simulation timestep active: incoming=%.9f corrected=%.9f targetFPS=%u",
                 frame_time, corrected_frame_time, g_target_fps);
+
+    // This executable rejects .text changes during its protected startup path.
+    // Apply the validated direct-call patch from the live simulation thread
+    // after startup has settled, rather than racing that protection here.
+    if (GetTickCount64() - g_install_time_ms >= 5000 &&
+        InterlockedCompareExchange(&g_havok_patch_state, 1, 0) == 0)
+    {
+        BOOL installed = PatchHavokTimestepCall(g_image_base + HAVOK_STEP_CALL_RVA,
+                                                g_image_base + HAVOK_STEP_RVA,
+                                                60.0f / (float)g_target_fps);
+        InterlockedExchange(&g_havok_patch_state, installed ? 2 : -1);
+    }
     g_simulation_step(step, corrected_frame_time);
 }
 
@@ -181,6 +314,7 @@ static DWORD WINAPI InstallHook(void *unused)
     }
 
     g_image_base = (BYTE *)GetModuleHandleA(NULL);
+    g_install_time_ms = GetTickCount64();
     void **qpc_iat = (void **)(g_image_base + QPC_IAT_RVA);
     g_query_performance_counter = (QueryPerformanceCounterFn)*qpc_iat;
     if (!g_query_performance_counter || !PatchPointer(qpc_iat, HookQueryPerformanceCounter))
@@ -254,7 +388,7 @@ static DWORD WINAPI InstallHook(void *unused)
         return 8;
     }
 
-    LogLine("DSHR render, simulation, FX, and Remo hooks installed: targetFPS=%u timestepScale=%.9f",
+    LogLine("DSHR render, simulation, FX, and Remo hooks installed; Havok timing correction armed: targetFPS=%u timestepScale=%.9f",
             g_target_fps, 60.0f / (float)g_target_fps);
     return 0;
 }
