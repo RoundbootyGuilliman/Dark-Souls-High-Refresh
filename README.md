@@ -6,11 +6,13 @@ It uses the dormant `FrpgFlipper_140FPS` scheduler included in the game and corr
 
 ## Installation
 
-1. Download `Dark-Souls-High-Refresh-v1.1.zip` from the [releases](https://github.com/RoundbootyGuilliman/Dark-Souls-High-Refresh/releases) section.
+1. Download `Dark-Souls-High-Refresh-v1.2.zip` from the [releases](https://github.com/RoundbootyGuilliman/Dark-Souls-High-Refresh/releases) section.
 2. Extract its contents into the Dark Souls Remastered directory beside `DarkSoulsRemastered.exe`.
 3. Open `DSHRHook.ini` and set `TargetFPS` to the desired frame rate. For the smoothest VRR experience it is recommended to keep this a few frames below your screen refresh rate (e.g. 162 for a 165hz screen).
-4. Start the game with `DSHRLauncher.exe`.
+4. Start the game normally.
 5. Set the in-game setting `System -> PC Settings -> Display -> Frequency` to the refresh rate of your monitor (not target FPS). So if you have a 165hz monitor, set it to `165hz`. Set the `Vertical sync` to `OFF`.
+
+If the game directory already contains a different `dinput8.dll`, do not overwrite it. Another proxy-based mod will require a compatibility solution before both can be used together.
 
 Example configuration:
 
@@ -29,13 +31,12 @@ Driver-level frame caps, V-sync, display refresh, or insufficient performance ca
 - Gameplay, movement, physics, and animation speed.
 - Particle and visual-effect timing, like flames, dust, and impact sparks.
 - FromSoftware's Remo in-engine cinematics.
-- (v1.1) Havok cloth, and rigid-body physics timing.
+- (v1.1) Havok cloth and rigid-body physics timing.
+- (v1.2) Launcher-free proxy loading with no cross-process injection.
 
 ## Uninstallation
 
-Close the game and remove `DSHRLauncher.exe`, `DSHRHook.dll`, `DSHRHook.ini`, `DSHRHook.log`, and `DSHR.log` from the game directory.
-
-The mod does not alter the game executable, saves, or packaged game assets. Launching `DarkSoulsRemastered.exe` normally also bypasses the mod.
+Close the game and remove `dinput8.dll`, `DSHRHook.ini`, and `DSHRHook.log` from the game directory.
 
 ## Tested with
 

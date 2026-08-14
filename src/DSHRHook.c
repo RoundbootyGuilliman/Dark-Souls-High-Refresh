@@ -4,6 +4,10 @@
 #include <stdarg.h>
 #include <stdint.h>
 
+// This source is built as dinput8.dll. Dark Souls Remastered imports
+// DirectInput8Create, so the game loads this proxy normally; the export below
+// forwards that call to the real system DLL while DSHR runs in-process.
+
 // Dark Souls Remastered 1.03 (SHA-1 F0ECFBE20D780751248DFB2A9759D6215E246676)
 // imports QueryPerformanceCounter through this IAT slot. Only the two reads in
 // its render-frame busy wait receive a scaled clock; all simulation and system
@@ -19,12 +23,17 @@
 #define REMO_ACTIVE_STATE_RVA 0x28EAE0
 #define HAVOK_STEP_CALL_RVA 0x15BD5E
 #define HAVOK_STEP_RVA 0x2A18B0
+#define FLIPPER_60_VTABLE_RVA 0x12A7248
+#define FLIPPER_140_VTABLE_RVA 0x12A72A0
 
 
 typedef BOOL (WINAPI *QueryPerformanceCounterFn)(LARGE_INTEGER *);
 typedef void (*SimulationStepFn)(void *step, float frame_time);
 typedef void (*FrpgFxUpdateFn)(void *manager, float frame_time);
 typedef void (*RemoActiveStateFn)(void *step, float frame_time, void *task_item);
+typedef HRESULT (WINAPI *DirectInput8CreateFn)(HINSTANCE instance, DWORD version,
+                                               const GUID *interface_id,
+                                               void **output, void *outer_unknown);
 
 static HMODULE g_module;
 static BYTE *g_image_base;
@@ -32,6 +41,9 @@ static QueryPerformanceCounterFn g_query_performance_counter;
 static SimulationStepFn g_simulation_step;
 static FrpgFxUpdateFn g_frpg_fx_update;
 static RemoActiveStateFn g_remo_active_state;
+static DirectInput8CreateFn g_direct_input8_create;
+static HMODULE g_system_dinput8;
+static INIT_ONCE g_dinput8_once = INIT_ONCE_STATIC_INIT;
 static void *g_havok_call_relay;
 static UINT g_target_fps = 140;
 static volatile LONG64 g_pacer_anchor;
@@ -40,11 +52,38 @@ static volatile LONG g_simulation_logged;
 static volatile LONG g_frpg_fx_logged;
 static volatile LONG g_remo_logged;
 static volatile LONG g_havok_patch_state;
+static volatile LONG g_scheduler_active;
 static volatile LONG g_remo_tick_phase;
 static ULONGLONG g_remo_last_input_ms;
 static ULONGLONG g_install_time_ms;
 static char g_log_path[MAX_PATH];
 
+
+static BOOL IsDarkSoulsRemasteredProcess(void)
+{
+    char path[MAX_PATH];
+    if (!GetModuleFileNameA(NULL, path, MAX_PATH))
+        return FALSE;
+
+    const char *name = path;
+    for (const char *scan = path; *scan; ++scan)
+        if (*scan == '\\' || *scan == '/') name = scan + 1;
+    if (lstrcmpiA(name, "DarkSoulsRemastered.exe") != 0)
+        return FALSE;
+
+    BYTE *image_base = (BYTE *)GetModuleHandleA(NULL);
+    IMAGE_DOS_HEADER *dos_header = (IMAGE_DOS_HEADER *)image_base;
+    if (!image_base || dos_header->e_magic != IMAGE_DOS_SIGNATURE ||
+        dos_header->e_lfanew <= 0 || dos_header->e_lfanew >= 0x100000)
+        return FALSE;
+
+    IMAGE_NT_HEADERS64 *nt_headers =
+        (IMAGE_NT_HEADERS64 *)(image_base + dos_header->e_lfanew);
+    return nt_headers->Signature == IMAGE_NT_SIGNATURE &&
+           nt_headers->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64 &&
+           nt_headers->OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
+           nt_headers->OptionalHeader.SizeOfImage > QPC_IAT_RVA + sizeof(void *);
+}
 
 static void BuildSiblingPath(char *output, const char *name)
 {
@@ -78,7 +117,7 @@ static void LogLine(const char *format, ...)
 static BOOL PatchPointer(void **address, void *replacement)
 {
     DWORD old_protection;
-    if (!VirtualProtect(address, sizeof(void *), PAGE_EXECUTE_READWRITE, &old_protection))
+    if (!VirtualProtect(address, sizeof(void *), PAGE_READWRITE, &old_protection))
         return FALSE;
     InterlockedExchangePointer(address, replacement);
     FlushInstructionCache(GetCurrentProcess(), address, sizeof(void *));
@@ -115,7 +154,7 @@ static void *AllocateRelayNear(BYTE *call_site)
     for (uintptr_t candidate = start; candidate < limit; candidate += granularity)
     {
         void *relay = VirtualAlloc((void *)candidate, 0x1000,
-                                   MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+                                   MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
         if (relay)
             return relay;
     }
@@ -170,6 +209,13 @@ static BOOL PatchHavokTimestepCall(BYTE *call_site, void *expected_target,
     CopyMemory(relay_code + 9, &original_relative_jump, sizeof(original_relative_jump));
     CopyMemory(relay_code + 13, &timestep_scale, sizeof(timestep_scale));
     CopyMemory(g_havok_call_relay, relay_code, sizeof(relay_code));
+    DWORD relay_protection;
+    if (!VirtualProtect(g_havok_call_relay, 0x1000, PAGE_EXECUTE_READ, &relay_protection))
+    {
+        LogLine("ERROR: could not make the Havok timestep relay executable (Win32=%lu)",
+                GetLastError());
+        goto release_relay;
+    }
     FlushInstructionCache(GetCurrentProcess(), g_havok_call_relay, sizeof(relay_code));
 
     intptr_t displacement = (BYTE *)g_havok_call_relay - (call_site + 5);
@@ -208,6 +254,7 @@ static BOOL WINAPI HookQueryPerformanceCounter(LARGE_INTEGER *counter)
     BOOL result = g_query_performance_counter(counter);
     void *caller = __builtin_return_address(0);
     if (!result || g_target_fps <= 60 ||
+        InterlockedCompareExchange(&g_scheduler_active, 0, 0) == 0 ||
         (caller != g_image_base + PACER_FIRST_CHECK_RETURN_RVA &&
          caller != g_image_base + PACER_LOOP_CHECK_RETURN_RVA))
         return result;
@@ -228,6 +275,12 @@ static BOOL WINAPI HookQueryPerformanceCounter(LARGE_INTEGER *counter)
 
 static void HookSimulationStep(void *step, float frame_time)
 {
+    if (InterlockedCompareExchange(&g_scheduler_active, 0, 0) == 0)
+    {
+        g_simulation_step(step, frame_time);
+        return;
+    }
+
     // The render scheduler calls this once per displayed frame. Retail always
     // supplies 1/60 second, including in the dormant 140-FPS scheduler, which
     // makes every time-based subsystem run at 140/60 speed. Preserve any
@@ -254,6 +307,12 @@ static void HookSimulationStep(void *step, float frame_time)
 
 static void HookFrpgFxUpdate(void *manager, float frame_time)
 {
+    if (InterlockedCompareExchange(&g_scheduler_active, 0, 0) == 0)
+    {
+        g_frpg_fx_update(manager, frame_time);
+        return;
+    }
+
     // The FRPG FX manager advances the core particle engine once per rendered
     // frame but the dormant high-refresh scheduler still supplies 1/60 second.
     // Scale that real FX delta before it reaches particles, emitters and their
@@ -280,6 +339,12 @@ static BOOL TakeRemoTimelineTick(void)
 
 static void HookRemoActiveState(void *step, float frame_time, void *task_item)
 {
+    if (InterlockedCompareExchange(&g_scheduler_active, 0, 0) == 0)
+    {
+        g_remo_active_state(step, frame_time, task_item);
+        return;
+    }
+
     // Remo (the in-engine cinematic system) ignores the scheduler's float
     // timestep and advances its authored timeline once per callback. The
     // dormant high-refresh scheduler therefore makes cinematics run at
@@ -298,6 +363,199 @@ static void HookRemoActiveState(void *step, float frame_time, void *task_item)
         LogLine("DSHR Remo timeline active: nativeRate=60 targetFPS=%u incoming=%.9f",
                 g_target_fps, frame_time);
     g_remo_active_state(step, frame_time, task_item);
+}
+
+static BOOL IsWritablePrivateRegion(const MEMORY_BASIC_INFORMATION *information)
+{
+    DWORD basic_protection = information->Protect & 0xFF;
+    return information->State == MEM_COMMIT &&
+           information->Type == MEM_PRIVATE &&
+           basic_protection == PAGE_READWRITE &&
+           (information->Protect & PAGE_GUARD) == 0;
+}
+
+static BYTE *SearchSchedulerRegion(const MEMORY_BASIC_INFORMATION *information,
+                                   uintptr_t expected_vtable)
+{
+    uintptr_t base = (uintptr_t)information->BaseAddress;
+    uintptr_t end = base + information->RegionSize;
+    uintptr_t cursor = (base + 7) & ~(uintptr_t)7;
+    if (end < base || end - base < 16)
+        return NULL;
+
+    for (; cursor <= end - 16; cursor += 8)
+    {
+        uintptr_t *candidate = (uintptr_t *)cursor;
+        if (candidate[0] == expected_vtable && candidate[1] == 0)
+            return (BYTE *)candidate;
+    }
+    return NULL;
+}
+
+static BYTE *FindSchedulerObject(uintptr_t expected_vtable, BOOL preferred_heap_only)
+{
+    uintptr_t address = 0x10000;
+    const uintptr_t limit = 0x100000000ull;
+    while (address < limit)
+    {
+        MEMORY_BASIC_INFORMATION information;
+        if (!VirtualQuery((void *)address, &information, sizeof(information)) ||
+            !information.RegionSize)
+            break;
+
+        uintptr_t next = (uintptr_t)information.BaseAddress + information.RegionSize;
+        if (next <= address)
+            break;
+
+        if (IsWritablePrivateRegion(&information) &&
+            ((preferred_heap_only && information.RegionSize == 0x02001000) ||
+             (!preferred_heap_only && information.RegionSize != 0x02001000 &&
+              information.RegionSize <= 0x08000000)))
+        {
+            BYTE *scheduler = SearchSchedulerRegion(&information, expected_vtable);
+            if (scheduler)
+                return scheduler;
+        }
+        address = next;
+    }
+    return NULL;
+}
+
+static LONG *FindSchedulerModeField(BYTE *scheduler)
+{
+    uintptr_t address = 0x10000;
+    const uintptr_t limit = 0x100000000ull;
+    while (address < limit)
+    {
+        MEMORY_BASIC_INFORMATION information;
+        if (!VirtualQuery((void *)address, &information, sizeof(information)) ||
+            !information.RegionSize)
+            break;
+
+        uintptr_t base = (uintptr_t)information.BaseAddress;
+        uintptr_t end = base + information.RegionSize;
+        uintptr_t next = end;
+        if (next <= address)
+            break;
+
+        if (IsWritablePrivateRegion(&information) &&
+            information.RegionSize <= 0x08000000 && end >= base && end - base >= 16)
+        {
+            uintptr_t cursor = (base + 15) & ~(uintptr_t)7;
+            for (; cursor <= end - 8; cursor += 8)
+            {
+                if (*(BYTE **)cursor == scheduler && *(LONG *)(cursor - 8) == 4)
+                    return (LONG *)(cursor - 8);
+            }
+        }
+        address = next;
+    }
+    return NULL;
+}
+
+typedef struct ProcessWindowSearch
+{
+    DWORD process_id;
+    BOOL found;
+} ProcessWindowSearch;
+
+static BOOL CALLBACK FindProcessWindow(HWND window, LPARAM parameter)
+{
+    ProcessWindowSearch *search = (ProcessWindowSearch *)parameter;
+    DWORD process_id;
+    GetWindowThreadProcessId(window, &process_id);
+    if (process_id == search->process_id && IsWindowVisible(window) &&
+        GetWindow(window, GW_OWNER) == NULL)
+    {
+        search->found = TRUE;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL HasVisibleProcessWindow(void)
+{
+    ProcessWindowSearch search = {GetCurrentProcessId(), FALSE};
+    EnumWindows(FindProcessWindow, (LPARAM)&search);
+    return search.found;
+}
+
+static BOOL ActivateHighRefreshScheduler(void)
+{
+    BOOL window_seen = FALSE;
+    uintptr_t flipper_60_vtable = (uintptr_t)(g_image_base + FLIPPER_60_VTABLE_RVA);
+    void *flipper_140_vtable = g_image_base + FLIPPER_140_VTABLE_RVA;
+
+    for (DWORD waited_ms = 0; waited_ms < 45000; waited_ms += 250)
+    {
+        if (!window_seen && HasVisibleProcessWindow())
+        {
+            window_seen = TRUE;
+            LogLine("DSHR game window initialized; locating the live 60-FPS scheduler");
+        }
+
+        if (window_seen)
+        {
+            BYTE *scheduler = FindSchedulerObject(flipper_60_vtable, TRUE);
+            if (!scheduler)
+                scheduler = FindSchedulerObject(flipper_60_vtable, FALSE);
+            if (scheduler)
+            {
+                LONG *mode_field = FindSchedulerModeField(scheduler);
+                if (mode_field)
+                {
+                    InterlockedExchangePointer((void **)scheduler, flipper_140_vtable);
+                    InterlockedExchange(mode_field, 5);
+                    if (*(void **)scheduler != flipper_140_vtable || *mode_field != 5)
+                    {
+                        LogLine("ERROR: high-refresh scheduler switch did not verify");
+                        return FALSE;
+                    }
+
+                    InterlockedExchange(&g_scheduler_active, 1);
+                    LogLine("DSHR live scheduler switched at %p; owner mode at %p changed from 4 to 5",
+                            scheduler, mode_field);
+                    return TRUE;
+                }
+            }
+        }
+        Sleep(250);
+    }
+
+    LogLine(window_seen
+            ? "ERROR: live 60-FPS scheduler was not found within 45 seconds"
+            : "ERROR: the game did not create a visible window within 45 seconds");
+    return FALSE;
+}
+
+static BOOL CALLBACK LoadSystemDInput8(PINIT_ONCE once, PVOID parameter, PVOID *context)
+{
+    (void)once;
+    (void)parameter;
+    (void)context;
+
+    char path[MAX_PATH];
+    UINT length = GetSystemDirectoryA(path, MAX_PATH);
+    if (!length || length + sizeof("\\dinput8.dll") > MAX_PATH)
+        return FALSE;
+    lstrcatA(path, "\\dinput8.dll");
+
+    g_system_dinput8 = LoadLibraryA(path);
+    if (!g_system_dinput8)
+        return FALSE;
+    g_direct_input8_create =
+        (DirectInput8CreateFn)GetProcAddress(g_system_dinput8, "DirectInput8Create");
+    return g_direct_input8_create != NULL;
+}
+
+__declspec(dllexport) HRESULT WINAPI DirectInput8Create(HINSTANCE instance, DWORD version,
+                                                        const GUID *interface_id,
+                                                        void **output, void *outer_unknown)
+{
+    if (!InitOnceExecuteOnce(&g_dinput8_once, LoadSystemDInput8, NULL, NULL) ||
+        !g_direct_input8_create)
+        return E_FAIL;
+    return g_direct_input8_create(instance, version, interface_id, output, outer_unknown);
 }
 
 static DWORD WINAPI InstallHook(void *unused)
@@ -360,7 +618,7 @@ static DWORD WINAPI InstallHook(void *unused)
 
     void **remo_active_state_entry = (void **)(g_image_base + REMO_ACTIVE_STATE_ENTRY_RVA);
     // This callback table is populated by a game-side static initializer after
-    // our DLL is injected. Wait on the hook worker thread until that initializer
+    // our proxy is loaded. Wait on the hook worker thread until that initializer
     // publishes the supported function instead of racing it or treating its
     // initial null slot as an unsupported executable.
     for (DWORD waited_ms = 0; waited_ms < 30000; waited_ms += 10)
@@ -388,7 +646,10 @@ static DWORD WINAPI InstallHook(void *unused)
         return 8;
     }
 
-    LogLine("DSHR render, simulation, FX, and Remo hooks installed; Havok timing correction armed: targetFPS=%u timestepScale=%.9f",
+    if (!ActivateHighRefreshScheduler())
+        return 9;
+
+    LogLine("DSHR proxy hooks and high-refresh scheduler active; Havok timing correction armed: targetFPS=%u timestepScale=%.9f",
             g_target_fps, 60.0f / (float)g_target_fps);
     return 0;
 }
@@ -400,8 +661,12 @@ BOOL WINAPI DllMain(HINSTANCE module, DWORD reason, LPVOID reserved)
     {
         g_module = module;
         DisableThreadLibraryCalls(module);
-        HANDLE thread = CreateThread(NULL, 0, InstallHook, NULL, 0, NULL);
-        if (thread) CloseHandle(thread);
+        if (IsDarkSoulsRemasteredProcess())
+        {
+            BuildSiblingPath(g_log_path, "DSHRHook.log");
+            HANDLE thread = CreateThread(NULL, 0, InstallHook, NULL, 0, NULL);
+            if (thread) CloseHandle(thread);
+        }
     }
     return TRUE;
 }
