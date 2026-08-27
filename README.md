@@ -2,11 +2,9 @@
 
 This mod enables high refresh rate and high FPS in Dark Souls Remastered while preserving the original game speed.
 
-It uses the dormant `FrpgFlipper_140FPS` scheduler included in the game and corrects the timing of rendering, gameplay, visual effects, and in-engine cinematics. Prerecorded movies are left untouched.
-
 ## Installation
 
-1. Download `Dark-Souls-High-Refresh-v1.3.zip` from the [releases](https://github.com/RoundbootyGuilliman/Dark-Souls-High-Refresh/releases) section.
+1. Download `Dark-Souls-High-Refresh-v1.4.zip` from the [releases](https://github.com/RoundbootyGuilliman/Dark-Souls-High-Refresh/releases) section.
 2. Extract its contents into the Dark Souls Remastered directory beside `DarkSoulsRemastered.exe`.
 3. Open `DSHRHook.ini` and set `TargetFPS` to the desired frame rate. For the smoothest VRR experience it is recommended to keep this a few frames below your screen refresh rate (e.g. 162 for a 165hz screen).
 4. Start the game normally.
@@ -34,6 +32,7 @@ Driver-level frame caps, V-sync, display refresh, or insufficient performance ca
 - (v1.1) Havok cloth and rigid-body physics timing.
 - (v1.2) Launcher-free proxy loading with no cross-process injection.
 - (v1.3) Support for the current November 2022 Steam executable.
+- (v1.4) Bug fixes: mouse sensitivity, controller menu navigation, and in-engine cinematics flickering.
 
 ## Uninstallation
 
@@ -46,7 +45,7 @@ Close the game before uninstalling.
 
 - Dark Souls Remastered PC patch `1.03` and `1.03.1` with either supported executable:
   - 2018 build SHA-1 `F0ECFBE20D780751248DFB2A9759D6215E246676`.
-  - November 2022 Steam build SHA-1 `9150CC63C617332ED3C2C66E7566ED67E3292DA0`.
+  - 2022 Steam build SHA-1 `9150CC63C617332ED3C2C66E7566ED67E3292DA0`.
 - Sustained gameplay and visual effects at 117 FPS / 120hz, and 162 FPS / 165hz.
 
 Only the exact executable builds identified above are supported.
@@ -54,8 +53,7 @@ Multiplayer compatibility has not been validated; keep the game offline while us
 
 ## Bug reporting
 
-As the game required separate and specific patching for several different game systems, namely the rendering, the gameplay simulation, the VFX and the in-engine cinematics, there could be something that i missed, and that will look or behave weird.
-If you encounter that, please let me know via the [issues](https://github.com/RoundbootyGuilliman/Dark-Souls-High-Refresh/issues) section. Include the save file so i can see and debug the issue right away.
+If you encounter bugs, please let me know via the [issues](https://github.com/RoundbootyGuilliman/Dark-Souls-High-Refresh/issues) section. Include the save file so i can see and debug the issue right away.
 
 ## License
 
